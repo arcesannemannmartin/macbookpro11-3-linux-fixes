@@ -303,6 +303,29 @@ scripts/cpu-bdprochot-guard        Thermal BD PROCHOT guard (thermal safety)
 scripts/smc-dc-power.py            Read real system power from the SMC
 ```
 
+## If you keep more than one kernel (main + LTS)
+
+Apply every cmdline/UKI change to **all** installed kernels. A stale second UKI means
+booting it brings back the 800 MHz clamp and the GMUX lag. On this machine each kernel has
+its own UKI and pacman hook:
+
+- main: `cachyos_intel_linux.efi` + `post-kernel-package.hook`
+- LTS: `cachyos_intel_linux_lts.efi` + `post-kernel-lts.hook`
+
+Both hooks call the same orchestrator with a kernel selector (`post-kernel-update.sh [main|lts]`),
+and `apply-patched-nouveau.sh [kver]` / `rebuild-intel-uki.sh [kver]` pick the right source tree
+and UKI by kernel version. Verify **both** after any change:
+
+```bash
+for u in cachyos_intel_linux.efi cachyos_intel_linux_lts.efi; do
+  printf "%-30s: " "$u"
+  sudo objcopy --dump-section .cmdline=/tmp/c.txt /boot/efi/EFI/Linux/$u && \
+    tr '\0' '\n' < /tmp/c.txt | grep -oE "processor.ignore_ppc=1|nouveau.modeset=0" | tr '\n' ' '
+  echo
+done
+# both must show: processor.ignore_ppc=1 nouveau.modeset=0
+```
+
 ## References
 
 - Linux: `drivers/acpi/processor_perflib.c` (`acpi_processor_ppc_notifier`,
