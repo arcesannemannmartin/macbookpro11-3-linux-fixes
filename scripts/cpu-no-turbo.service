@@ -1,0 +1,12 @@
+[Unit]
+Description=Deshabilitar turbo del CPU (MacBookPro11,3) — evita el ciclo térmico 90C -> BD PROCHOT -> 800MHz que causa input lag
+Documentation=file:docs/DIAGNOSTICO-CLAMP-800MHZ.md
+After=cpufreq-ondemand.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo 0 > /sys/devices/system/cpu/cpufreq/boost'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

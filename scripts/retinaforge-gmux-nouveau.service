@@ -1,0 +1,15 @@
+[Unit]
+Description=RetinaForge: recargar nouveau con KMS post-boot (evita el split del GMUX que cuelga el flip de i915)
+Documentation=file:docs/DIAGNOSTICO-CLAMP-800MHZ.md
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=display-manager.service
+ConditionPathExists=/sys/module/apple_gmux
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'modprobe -r nouveau 2>/dev/null || true; modprobe nouveau modeset=1; sleep 1; logger -t retinaforge "nouveau recargado con KMS: $(ls /sys/class/drm/ 2>/dev/null | grep -cE "^card[0-9]+$") cards DRM"'
+
+[Install]
+WantedBy=multi-user.target

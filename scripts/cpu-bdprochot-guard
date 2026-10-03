@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Guard termico del cap del CPU (BD PROCHOT).
+#
+# Que hace: el PMIC de esta placa (MacBookPro11,3 con mod de GT 750M) puede
+# assertar BD PROCHOT al CPU (MSR 0x1FC bit 0) y dejarlo clavado a 798 MHz.
+# Medido: con el bit en 1 el CPU va a 798 MHz, y limpiandolo —misma carga—
+# sube a tope. El hardware NO re-asserta el bit solo: queda en 0 hasta que
+# alguien lo escriba. Por eso el guard lo aserta cuando se calienta.
+#
+# v3 (2026-10-03): SIMPLIFICADO a solo-termico. Se sacaron la deteccion del
+# pstate de la dGPU (apuntaba a /sys/class/drm/card*/device/pstate, que no
+# existe: el pstate real vive en debugfs dri/<n>/pstate) y el calculo de busy
+# (/proc/stat es acumulativo: daba el promedio desde boot, no instantaneo).
+# Ninguno aportaba: el clamp de 800 que se perseguia es _PPC (ACPI), no
+# BD PROCHOT, y la proteccion termica no necesita gates de busy.
+#
+# Config: TEMP_LIMIT_C (90), HYST_C (5), STATE, MODE=manual no hace nada.
+set -uo pipefail
+
+TEMP_LIMIT_C="${TEMP_LIMIT_C:-90}"
+HYST_C="${HYST_C:-5}"
+STATE="${STATE:-/run/cpu-bdprochot-guard.state}"
+MSR=0x1FC
+# Indice del bit, no mascara: (val >> bit) & 1. BD PROCHOT es el bit 0.
+BD_PROCHOT_BIT=0
+MODE="${MODE:-auto}"
+INTERVAL_S="${INTERVAL_S:-5}"   # debe coincidir con OnUnitActiveSec del timer
+
+if [ "$MODE" = "manual" ]; then
+    exit 0
+fi
+[ -e /dev/cpu/0/msr ] || { echo "cpu-bdprochot-guard: no existe /dev/cpu/*/msr" >&2; exit 0; }
+
+# Maximo de los sensores coretemp (temp1 = Package, temp2..5 = cores).
+TEMP=$(for h in /sys/class/hwmon/hwmon*; do
+    [ "$(cat "$h/name" 2>/dev/null)" = "coretemp" ] || continue
+    for f in "$h"/temp*_input; do
+        [ -r "$f" ] || continue
+        cat "$f" 2>/dev/null
+    done
+done | awk '{ if ($1 > m) m = $1 } END { if (m) printf "%d", m/1000; else print 0 }')
+
+[ "$TEMP" = "0" ] && { echo "cpu-bdprochot-guard: no pude leer la temperatura" >&2; exit 0; }
+
+# Estado deseado:
+#  - Histéresis: asertar al tocar el limite, limpiar solo cuando baja HYST_C.
+#  - Proyeccion: el CPU sube ~4 C/s con carga total, mas rapido que el timer;
+#    si al proximo chequeo la temperatura va a pasar el limite, se frena ahora.
+if   [ "$TEMP" -ge "$TEMP_LIMIT_C" ];      then WANT=1
+elif [ "$TEMP" -le $((TEMP_LIMIT_C - HYST_C)) ]; then WANT=0
+else
+    PREV=$(cat "$STATE.prev" 2>/dev/null) || PREV=""
+    PTIME=$(stat -c %Y "$STATE.prev" 2>/dev/null) || PTIME=0
+    NOW=$(date +%s)
+    RATE=0
+    if [ -n "$PREV" ] && [ "$PTIME" -gt 0 ] && [ "$NOW" -gt "$PTIME" ]; then
+        RATE=$(( (TEMP - PREV) * INTERVAL_S / (NOW - PTIME) ))
+    fi
+    PROJECTED=$((TEMP + RATE))
+    if [ "$PROJECTED" -ge "$TEMP_LIMIT_C" ]; then
+        WANT=1
+    else
+        WANT=KEEP
+    fi
+fi
+
+printf '%s\n' "$TEMP" > "$STATE.prev" 2>/dev/null || true
+
+if [ "$WANT" = "KEEP" ]; then
+    exit 0
+fi
+
+CACHED=$(cat "$STATE" 2>/dev/null) || CACHED=""
+[ "$CACHED" = "$WANT" ] && exit 0
+
+python3 - "$MSR" "$BD_PROCHOT_BIT" "$WANT" "$STATE" "$TEMP" "$TEMP_LIMIT_C" <<'PY'
+import glob, struct, sys
+addr, bit, want = int(sys.argv[1], 16), int(sys.argv[2]), int(sys.argv[3])
+statef, temp, limit = sys.argv[4], sys.argv[5], sys.argv[6]
+
+def read(path):
+    with open(path, 'rb') as f:
+        f.seek(addr)
+        return struct.unpack('<Q', f.read(8))[0]
+
+cores = sorted(glob.glob('/dev/cpu/[0-9]*/msr'))
+written = 0
+for p in cores:
+    try:
+        val = read(p)
+        new = val | (1 << bit) if want else val & ~(1 << bit)
+        if new == val:
+            continue
+        with open(p, 'wb') as f:
+            f.seek(addr); f.write(struct.pack('<Q', new))
+        written += 1
+    except OSError:
+        pass
+
+try:
+    with open(statef, 'w') as f:
+        f.write(str(want))
+except OSError:
+    pass
+
+if want:
+    print(f"cpu-bdprochot-guard: {temp}C >= {limit}C, aserto BD PROCHOT "
+          f"en {written} core(s) para bajar el CPU")
+else:
+    print(f"cpu-bdprochot-guard: {temp}C, limpio BD PROCHOT "
+          f"en {written} core(s) (CPU libre)")
+PY
+exit 0
